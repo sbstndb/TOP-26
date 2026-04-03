@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -118,19 +119,12 @@ int main(int argc, char* argv[]) {
     if (rank == RANK_MASTER) {
       fprintf(stderr, "\rStep: %6d/%6d", i, ITERATIONS);
     }
-    // Compute special actions (border, obstacle...)
-    special_cells(&mesh, &mesh_type, &mesh_comm);
-    // Need to wait all before doing next step
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // Compute collision term
-    collision(&temp, &mesh);
-    // Need to wait all before doing next step
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // Propagate values from node to neighboors
-    lbm_comm_halo_exchange(&mesh_comm, &temp);
-    propagation(&mesh, &temp);
+    // Halo exchange on input mesh before fused collide+stream
+    lbm_comm_halo_exchange(&mesh_comm, &mesh);
+    // Fused BC + collision + scatter: mesh -> temp
+    collide_and_stream(&temp, &mesh, &mesh_type, &mesh_comm);
+    // Swap pointers so mesh holds the new state
+    std::swap(mesh.cells, temp.cells);
     // Need to wait all before doing next step
     MPI_Barrier(MPI_COMM_WORLD);
 

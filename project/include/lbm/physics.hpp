@@ -92,6 +92,15 @@ void special_cells(Mesh* mesh, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mes
 /// @param mesh_in after special actions.
 void collision(Mesh* mesh_out, const Mesh* mesh_in);
 
+/// @brief Fused special_cells + collision: applies boundary conditions in-place on mesh_in,
+///        then computes collision from mesh_in into mesh_out, in a single pass.
+void special_cells_and_collision(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mesh_comm);
+
+/// @brief Fused collide-and-stream: applies BC in-place, computes collision,
+///        and scatters each direction to the destination cell in mesh_out.
+///        Replaces separate special_cells_and_collision + propagation passes.
+void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mesh_comm);
+
 /// @brief Propagate the densities on the neighboor meshes.
 /// @param mesh_out Output mesh.
 /// @param mesh_in Input mesh (cannot be the same).

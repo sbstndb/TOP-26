@@ -18,5 +18,7 @@ target_sources(
       FILES ${CMAKE_BINARY_DIR}/include/lbm/tpl.hpp ${CMAKE_BINARY_DIR}/include/lbm/tpl_loader.hpp
   PRIVATE config.cpp structures.cpp communications.cpp initialization.cpp physics.cpp
 )
+target_compile_options(top.lbm-lib PRIVATE -march=native -O3 -flto)
+target_link_options(top.lbm-lib PRIVATE -flto)
 target_link_libraries(top.lbm-lib PRIVATE MPI::MPI_CXX OpenMP::OpenMP_CXX)
 set_target_properties(top.lbm-lib PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
