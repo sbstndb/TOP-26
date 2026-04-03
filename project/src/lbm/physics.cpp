@@ -243,45 +243,49 @@ void special_cells_and_collision(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t*
   assert(mesh_in->width == mesh_out->width);
   assert(mesh_in->height == mesh_out->height);
 
-  const size_t w = mesh_in->width;
-  const size_t h = mesh_in->height;
+  const int w = (int)mesh_in->width;
+  const int h = (int)mesh_in->height;
+  const size_t WH = (size_t)w * h;
+  const double relax = RELAX_PARAMETER;
 
-#if TILE_X > 0
-  // Tiled fused pass: process TILE_X columns at a time for better L2 cache reuse
-  for (size_t i0 = 1; i0 < w - 1; i0 += TILE_X) {
-    const size_t i_end = (i0 + TILE_X < w - 1) ? (i0 + TILE_X) : (w - 1);
-    for (size_t i = i0; i < i_end; i++) {
-#else
-  // Untiled fused pass
-  {
-    for (size_t i = 1; i < w - 1; i++) {
-#endif
-      for (size_t j = 1; j < h - 1; j++) {
-        double f_in[DIRECTIONS];
-        Mesh_gather_cell(mesh_in, (int)i, (int)j, f_in);
+  // --- Step 1: Apply boundary conditions (only non-fluid cells, small fraction) ---
+  special_cells(mesh_in, mesh_type, mesh_comm);
 
-        // Apply boundary conditions in-place on the gathered buffer
-        switch (*(lbm_cell_type_t_get_cell(mesh_type, i, j))) {
-        case CELL_FUILD:
-          break;
-        case CELL_BOUNCE_BACK:
-          compute_bounce_back(f_in);
-          break;
-        case CELL_LEFT_IN:
-          compute_inflow_zou_he_poiseuille_distr(mesh_in, f_in, j + mesh_comm->y);
-          break;
-        case CELL_RIGHT_OUT:
-          compute_outflow_zou_he_const_density(f_in);
-          break;
-        }
+  // --- Step 2: Single-pass collision — read 9 planes, compute, write 9 planes ---
+  // No temporary arrays needed. Direct SoA plane access.
+  const double* __restrict__ fi[DIRECTIONS];
+  double* __restrict__ fo[DIRECTIONS];
+  for (int k = 0; k < DIRECTIONS; k++) {
+    fi[k] = Mesh_dir(mesh_in, k);
+    fo[k] = Mesh_dir(mesh_out, k);
+  }
 
-        // Write updated values back to mesh_in (BC applied in-place)
-        Mesh_scatter_cell(mesh_in, (int)i, (int)j, f_in);
+  for (int i = 1; i < w - 1; i++) {
+    for (int j = 1; j < h - 1; j++) {
+      const int idx = i * h + j;
 
-        // Compute collision from (updated) f_in into mesh_out
-        double f_out[DIRECTIONS];
-        compute_cell_collision(f_out, f_in);
-        Mesh_scatter_cell(mesh_out, (int)i, (int)j, f_out);
+      // Read all 9 directions from SoA planes
+      const double f0 = fi[0][idx], f1 = fi[1][idx], f2 = fi[2][idx];
+      const double f3 = fi[3][idx], f4 = fi[4][idx], f5 = fi[5][idx];
+      const double f6 = fi[6][idx], f7 = fi[7][idx], f8 = fi[8][idx];
+
+      // Density
+      const double rho = f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8;
+      const double inv_rho = 1.0 / rho;
+
+      // Velocity
+      const double vx = (f1 - f3 + f5 - f6 - f7 + f8) * inv_rho;
+      const double vy = (f2 - f4 + f5 + f6 - f7 - f8) * inv_rho;
+      const double v2 = vx * vx + vy * vy;
+
+      // Precompute dot products
+      const double p[9] = {0.0, vx, vy, -vx, -vy, vx + vy, -vx + vy, -vx - vy, vx - vy};
+
+      // BGK collision — write directly to output planes
+      const double fk[9] = {f0, f1, f2, f3, f4, f5, f6, f7, f8};
+      for (int k = 0; k < DIRECTIONS; k++) {
+        const double f_eq = equil_weight[k] * rho * (1.0 + 3.0 * p[k] + 4.5 * p[k] * p[k] - 1.5 * v2);
+        fo[k][idx] = fk[k] - relax * (fk[k] - f_eq);
       }
     }
   }
