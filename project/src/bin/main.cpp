@@ -119,14 +119,18 @@ int main(int argc, char* argv[]) {
     if (rank == RANK_MASTER) {
       fprintf(stderr, "\rStep: %6d/%6d", i, ITERATIONS);
     }
-    // Halo exchange on input mesh before fused collide+stream
-    lbm_comm_halo_exchange(&mesh_comm, &mesh);
-    // Fused BC + collision + scatter: mesh -> temp
-    collide_and_stream(&temp, &mesh, &mesh_type, &mesh_comm);
-    // Swap pointers so mesh holds the new state
-    std::swap(mesh.cells, temp.cells);
-    // Need to wait all before doing next step
-    MPI_Barrier(MPI_COMM_WORLD);
+    if (comm_size == 1) {
+      // Single process: fused collide+stream (no halo exchange needed)
+      collide_and_stream(&temp, &mesh, &mesh_type, &mesh_comm);
+      std::swap(mesh.cells, temp.cells);
+    } else {
+      // Multi-process: 3-step with post-collision halo exchange
+      special_cells_and_collision(&temp, &mesh, &mesh_type, &mesh_comm);
+      MPI_Barrier(MPI_COMM_WORLD);
+      lbm_comm_halo_exchange(&mesh_comm, &temp);
+      propagation(&mesh, &temp);
+      MPI_Barrier(MPI_COMM_WORLD);
+    }
 
     // Save step
     if (i % WRITE_STEP_INTERVAL == 0 && lbm_gbl_config.output_filename != NULL) {

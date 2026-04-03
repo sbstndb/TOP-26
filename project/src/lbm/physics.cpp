@@ -417,7 +417,8 @@ void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_typ
   // We handle this by iterating over all cells in the 2-wide border strip and
   // fixing up only the directions whose source is not an inner cell.
 
-  // Helper lambda: for destination (di, dj), fix directions with non-inner sources
+  // Helper lambda: for destination (di, dj), fix directions with non-inner sources.
+  // Only used for np=1 where all ghost cells are physical boundaries (raw copy).
   auto fixup_cell = [&](int di, int dj) {
     for (int k = 0; k < DIRECTIONS; k++) {
       int si = di - dir_x[k];
@@ -425,7 +426,7 @@ void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_typ
       // If source is an inner cell, scatter already wrote the correct value
       if (si >= 1 && si <= w - 2 && sj >= 1 && sj <= h - 2)
         continue;
-      // Otherwise gather raw from mesh_in (no collision applied to ghost cells)
+      // Physical boundary ghost: copy raw (no collision)
       if (si >= 0 && si < w && sj >= 0 && sj < h)
         Mesh_f(mesh_out, k, di, dj) = Mesh_f(mesh_in, k, si, sj);
     }
