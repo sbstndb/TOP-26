@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 
 #include <omp.h>
 
@@ -193,22 +194,31 @@ void compute_outflow_zou_he_const_density(lbm_mesh_cell_t cell) {
 }
 
 void special_cells(Mesh* mesh, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mesh_comm) {
-  // Loop on all inner cells — already outer i, inner j for cache locality
+  // Loop on all inner cells — gather into local buffer, apply BC, scatter back
   for (size_t i = 1; i < mesh->width - 1; i++) {
     for (size_t j = 1; j < mesh->height - 1; j++) {
-      switch (*(lbm_cell_type_t_get_cell(mesh_type, i, j))) {
+      lbm_cell_type_t type = *(lbm_cell_type_t_get_cell(mesh_type, i, j));
+      if (type == CELL_FUILD)
+        continue;
+
+      double f[DIRECTIONS];
+      Mesh_gather_cell(mesh, (int)i, (int)j, f);
+
+      switch (type) {
       case CELL_FUILD:
         break;
       case CELL_BOUNCE_BACK:
-        compute_bounce_back(Mesh_get_cell(mesh, i, j));
+        compute_bounce_back(f);
         break;
       case CELL_LEFT_IN:
-        compute_inflow_zou_he_poiseuille_distr(mesh, Mesh_get_cell(mesh, i, j), j + mesh_comm->y);
+        compute_inflow_zou_he_poiseuille_distr(mesh, f, j + mesh_comm->y);
         break;
       case CELL_RIGHT_OUT:
-        compute_outflow_zou_he_const_density(Mesh_get_cell(mesh, i, j));
+        compute_outflow_zou_he_const_density(f);
         break;
       }
+
+      Mesh_scatter_cell(mesh, (int)i, (int)j, f);
     }
   }
 }
@@ -217,10 +227,14 @@ void collision(Mesh* mesh_out, const Mesh* mesh_in) {
   assert(mesh_in->width == mesh_out->width);
   assert(mesh_in->height == mesh_out->height);
 
-  // Loop on all inner cells — outer i, inner j for cache locality
+  // Loop on all inner cells — gather, compute collision, scatter (Option A)
   for (size_t i = 1; i < mesh_in->width - 1; i++) {
     for (size_t j = 1; j < mesh_in->height - 1; j++) {
-      compute_cell_collision(Mesh_get_cell(mesh_out, i, j), Mesh_get_cell(mesh_in, i, j));
+      double f_in[DIRECTIONS];
+      double f_out[DIRECTIONS];
+      Mesh_gather_cell(mesh_in, (int)i, (int)j, f_in);
+      compute_cell_collision(f_out, f_in);
+      Mesh_scatter_cell(mesh_out, (int)i, (int)j, f_out);
     }
   }
 }
@@ -243,98 +257,82 @@ void special_cells_and_collision(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t*
     for (size_t i = 1; i < w - 1; i++) {
 #endif
       for (size_t j = 1; j < h - 1; j++) {
-        lbm_mesh_cell_t cell_in = Mesh_get_cell(mesh_in, i, j);
+        double f_in[DIRECTIONS];
+        Mesh_gather_cell(mesh_in, (int)i, (int)j, f_in);
 
-        // Apply boundary conditions in-place on the input cell
+        // Apply boundary conditions in-place on the gathered buffer
         switch (*(lbm_cell_type_t_get_cell(mesh_type, i, j))) {
         case CELL_FUILD:
           break;
         case CELL_BOUNCE_BACK:
-          compute_bounce_back(cell_in);
+          compute_bounce_back(f_in);
           break;
         case CELL_LEFT_IN:
-          compute_inflow_zou_he_poiseuille_distr(mesh_in, cell_in, j + mesh_comm->y);
+          compute_inflow_zou_he_poiseuille_distr(mesh_in, f_in, j + mesh_comm->y);
           break;
         case CELL_RIGHT_OUT:
-          compute_outflow_zou_he_const_density(cell_in);
+          compute_outflow_zou_he_const_density(f_in);
           break;
         }
 
-        // Now compute collision from (updated) mesh_in into mesh_out
-        compute_cell_collision(Mesh_get_cell(mesh_out, i, j), cell_in);
+        // Write updated values back to mesh_in (BC applied in-place)
+        Mesh_scatter_cell(mesh_in, (int)i, (int)j, f_in);
+
+        // Compute collision from (updated) f_in into mesh_out
+        double f_out[DIRECTIONS];
+        compute_cell_collision(f_out, f_in);
+        Mesh_scatter_cell(mesh_out, (int)i, (int)j, f_out);
       }
     }
   }
 }
 
 void propagation(Mesh* mesh_out, const Mesh* mesh_in) {
-  const int w = mesh_out->width;
-  const int h = mesh_out->height;
+  const int w = (int)mesh_out->width;
+  const int h = (int)mesh_out->height;
 
-  // Gather pattern: for each destination cell, read from source neighbors
-  // Direction offsets: direction k propagates FROM (i - dx[k], j - dy[k])
+  // Direction offsets: direction k propagates FROM (i, j) TO (i + dx[k], j + dy[k])
+  // Equivalently, destination (i,j) receives direction k from source (i - dx[k], j - dy[k])
   static const int dir_x[DIRECTIONS] = {0, +1, 0, -1, 0, +1, -1, -1, +1};
   static const int dir_y[DIRECTIONS] = {0, 0, +1, 0, -1, +1, +1, -1, -1};
 
-#if TILE_X > 0
-  // Interior cells — tiled along x for L2 cache reuse, gather from neighbors
-  for (int i0 = 1; i0 < w - 1; i0 += TILE_X) {
-    const int i_end = (i0 + (int)TILE_X < w - 1) ? (i0 + (int)TILE_X) : (w - 1);
-    for (int i = i0; i < i_end; i++) {
-#else
-  // Interior cells — untiled, gather from neighbors
-  {
-    for (int i = 1; i < w - 1; i++) {
-#endif
-      for (int j = 1; j < h - 1; j++) {
-        double* __restrict__ cell_out = Mesh_get_cell(mesh_out, i, j);
-        for (int k = 0; k < DIRECTIONS; k++) {
-          cell_out[k] = Mesh_get_cell(mesh_in, i - dir_x[k], j - dir_y[k])[k];
-        }
-      }
-    }
-  }
+  // With SoA layout, propagation is a shifted copy per direction.
+  // For each direction k, we copy from mesh_in's direction-k plane to mesh_out's
+  // direction-k plane with an offset of (dir_x[k], dir_y[k]).
+  //
+  // For inner cells, the source range must be valid:
+  //   source (i, j) where destination (i + dx, j + dy) is in [0, w) x [0, h)
+  //   and source (i, j) is in [0, w) x [0, h)
 
-  // Border cells — with bounds check, gather pattern
-  // Top row (j=0)
-  for (int i = 0; i < w; i++) {
-    double* cell_out = Mesh_get_cell(mesh_out, i, 0);
-    for (int k = 0; k < DIRECTIONS; k++) {
-      int si = i - dir_x[k];
-      int sj = 0 - dir_y[k];
-      if (si >= 0 && si < w && sj >= 0 && sj < h)
-        cell_out[k] = Mesh_get_cell(mesh_in, si, sj)[k];
+  for (int k = 0; k < DIRECTIONS; k++) {
+    const int dx = dir_x[k];
+    const int dy = dir_y[k];
+
+    // Valid source range: 0 <= src < dim  AND  0 <= src + d < dim
+    // => src in [max(0, -d), min(dim, dim - d))
+    const int src_i_min = (-dx > 0) ? -dx : 0;
+    const int src_i_max = (w - dx < w) ? (w - dx) : w;
+    const int src_j_min = (-dy > 0) ? -dy : 0;
+    const int src_j_max = (h - dy < h) ? (h - dy) : h;
+
+    const double* __restrict__ src_plane = Mesh_dir(mesh_in, k);
+    double* __restrict__ dst_plane = Mesh_dir(mesh_out, k);
+
+    // Iterate over valid source cells; each row in j is contiguous in memory
+    for (int i = src_i_min; i < src_i_max; i++) {
+      const int dst_i = i + dx;
+      // src offset:  i * h + src_j_min
+      // dst offset:  dst_i * h + (src_j_min + dy)
+      const double* __restrict__ src_row = &src_plane[i * h + src_j_min];
+      double* __restrict__ dst_row = &dst_plane[dst_i * h + (src_j_min + dy)];
+      const int count = src_j_max - src_j_min;
+      // This is a contiguous copy of `count` doubles along the j-dimension
+      memcpy(dst_row, src_row, (size_t)count * sizeof(double));
     }
-  }
-  // Bottom row (j=h-1)
-  for (int i = 0; i < w; i++) {
-    double* cell_out = Mesh_get_cell(mesh_out, i, h - 1);
-    for (int k = 0; k < DIRECTIONS; k++) {
-      int si = i - dir_x[k];
-      int sj = (h - 1) - dir_y[k];
-      if (si >= 0 && si < w && sj >= 0 && sj < h)
-        cell_out[k] = Mesh_get_cell(mesh_in, si, sj)[k];
-    }
-  }
-  // Left column (i=0), skip corners
-  for (int j = 1; j < h - 1; j++) {
-    double* cell_out = Mesh_get_cell(mesh_out, 0, j);
-    for (int k = 0; k < DIRECTIONS; k++) {
-      int si = 0 - dir_x[k];
-      int sj = j - dir_y[k];
-      if (si >= 0 && si < w && sj >= 0 && sj < h)
-        cell_out[k] = Mesh_get_cell(mesh_in, si, sj)[k];
-    }
-  }
-  // Right column (i=w-1), skip corners
-  for (int j = 1; j < h - 1; j++) {
-    double* cell_out = Mesh_get_cell(mesh_out, w - 1, j);
-    for (int k = 0; k < DIRECTIONS; k++) {
-      int si = (w - 1) - dir_x[k];
-      int sj = j - dir_y[k];
-      if (si >= 0 && si < w && sj >= 0 && sj < h)
-        cell_out[k] = Mesh_get_cell(mesh_in, si, sj)[k];
-    }
+
+    // For direction k=0 (no shift), the above covers the entire mesh.
+    // For other directions, border cells that have no valid source are left
+    // untouched (they are ghost/phantom cells updated by halo exchange).
   }
 }
 
@@ -364,7 +362,9 @@ void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_typ
     for (int i = 1; i < w - 1; i++) {
 #endif
       for (int j = 1; j < h - 1; j++) {
-        lbm_mesh_cell_t cell_in = Mesh_get_cell(mesh_in, i, j);
+        // Gather the 9 directions for cell (i, j) from SoA into a local buffer
+        double cell_in[DIRECTIONS];
+        Mesh_gather_cell(mesh_in, i, j, cell_in);
 
         // Apply boundary conditions in-place on cell_in
         switch (*(lbm_cell_type_t_get_cell(mesh_type, i, j))) {
@@ -397,17 +397,18 @@ void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_typ
         };
 
         // Collision + scatter: compute post-collision value and write to destination
+        // With SoA, we write directly into mesh_out's per-direction planes
         for (int k = 0; k < DIRECTIONS; k++) {
           const double f_eq = equil_weight[k] * density * (1.0 + 3.0 * p[k] + 4.5 * p[k] * p[k] - 1.5 * v2);
           const double collided = cell_in[k] - relax * (cell_in[k] - f_eq);
-          Mesh_get_cell(mesh_out, i + dir_x[k], j + dir_y[k])[k] = collided;
+          Mesh_f(mesh_out, k, i + dir_x[k], j + dir_y[k]) = collided;
         }
       }
     }
   }
 
-  // --- Fixup pass: for any destination cell (i,j) and direction k where the  ---
-  // --- source (i-dx[k], j-dy[k]) is NOT an inner cell, gather from mesh_in. ---
+  // --- Fixup pass: for any destination cell (di,dj) and direction k where the  ---
+  // --- source (di-dx[k], dj-dy[k]) is NOT an inner cell, gather from mesh_in. ---
   // The scatter above only handles inner SOURCE cells [1,w-2]x[1,h-2].
   // Destination cells that need contributions from ghost/border source cells
   // include: border rows/cols (j=0, j=h-1, i=0, i=w-1) AND inner cells
@@ -418,7 +419,6 @@ void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_typ
 
   // Helper lambda: for destination (di, dj), fix directions with non-inner sources
   auto fixup_cell = [&](int di, int dj) {
-    double* cell_out = Mesh_get_cell(mesh_out, di, dj);
     for (int k = 0; k < DIRECTIONS; k++) {
       int si = di - dir_x[k];
       int sj = dj - dir_y[k];
@@ -427,7 +427,7 @@ void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_typ
         continue;
       // Otherwise gather raw from mesh_in (no collision applied to ghost cells)
       if (si >= 0 && si < w && sj >= 0 && sj < h)
-        cell_out[k] = Mesh_get_cell(mesh_in, si, sj)[k];
+        Mesh_f(mesh_out, k, di, dj) = Mesh_f(mesh_in, k, si, sj);
     }
   };
 

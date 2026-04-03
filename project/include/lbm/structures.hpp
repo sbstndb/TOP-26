@@ -97,15 +97,39 @@ void save_frame(FILE* fp, const Mesh* mesh);
 /// @brief Prints a fatal error message.
 void fatal(const char* message);
 
-/// @brief Retrieves a cell of a mesh given its coordinates.
-static inline lbm_mesh_cell_t Mesh_get_cell(const Mesh* mesh, int x, int y) {
-  return &mesh->cells[(x * mesh->height + y) * DIRECTIONS];
+/// @brief SoA accessor: get reference to f[k] at cell (x, y).
+/// Layout: cells[k * width * height + x * height + y]
+static inline double& Mesh_f(const Mesh* mesh, int k, int x, int y) {
+  return mesh->cells[(size_t)k * mesh->width * mesh->height + (size_t)x * mesh->height + y];
 }
 
-/// @brief Retrieves a column of a mesh given the `x` coordinate.
-static inline lbm_mesh_cell_t Mesh_get_col(const Mesh* mesh, int x) {
-  // `+ DIRECTIONS` to skip the first (phantom) line
-  return &mesh->cells[x * mesh->height * DIRECTIONS + DIRECTIONS];
+/// @brief Get pointer to the start of direction k's data array.
+static inline double* Mesh_dir(const Mesh* mesh, int k) {
+  return &mesh->cells[(size_t)k * mesh->width * mesh->height];
+}
+
+/// @brief AoS-compatible accessor (gathers into caller-provided buffer).
+/// Used for boundary condition functions that work on a single cell's 9 values.
+static inline void Mesh_gather_cell(const Mesh* mesh, int x, int y, double* out) {
+  const size_t WH = (size_t)mesh->width * mesh->height;
+  const size_t idx = (size_t)x * mesh->height + y;
+  for (int k = 0; k < DIRECTIONS; k++) {
+    out[k] = mesh->cells[k * WH + idx];
+  }
+}
+
+/// @brief Write 9 values back to a cell's SoA locations.
+static inline void Mesh_scatter_cell(Mesh* mesh, int x, int y, const double* in) {
+  const size_t WH = (size_t)mesh->width * mesh->height;
+  const size_t idx = (size_t)x * mesh->height + y;
+  for (int k = 0; k < DIRECTIONS; k++) {
+    mesh->cells[k * WH + idx] = in[k];
+  }
+}
+
+/// @brief Retrieves a column of direction k starting at (x, 1) — skips phantom row.
+static inline double* Mesh_get_col_dir(const Mesh* mesh, int k, int x) {
+  return &mesh->cells[(size_t)k * mesh->width * mesh->height + (size_t)x * mesh->height + 1];
 }
 
 /// @brief Retrieves a pointer on the cell type of a mesh given its coordinates.
