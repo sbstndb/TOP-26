@@ -102,6 +102,9 @@ int main(int argc, char* argv[]) {
   setup_init_state(&mesh, &mesh_type, &mesh_comm);
   setup_init_state(&temp, &mesh_type, &mesh_comm);
 
+  // Exchange cell types once so ghost cells carry the correct BC type
+  lbm_comm_exchange_cell_types(&mesh_comm, &mesh_type);
+
   // Write initial condition in output file
   if (lbm_gbl_config.output_filename != NULL) {
     save_frame_all_domain(fp, &mesh, &temp_render);
@@ -119,18 +122,12 @@ int main(int argc, char* argv[]) {
     if (rank == RANK_MASTER) {
       fprintf(stderr, "\rStep: %6d/%6d", i, ITERATIONS);
     }
-    if (comm_size == 1) {
-      // Single process: fused collide+stream (no halo exchange needed)
-      collide_and_stream(&temp, &mesh, &mesh_type, &mesh_comm);
-      std::swap(mesh.cells, temp.cells);
-    } else {
-      // Multi-process: 3-step with post-collision halo exchange
-      special_cells_and_collision(&temp, &mesh, &mesh_type, &mesh_comm);
-      MPI_Barrier(MPI_COMM_WORLD);
-      lbm_comm_halo_exchange(&mesh_comm, &temp);
-      propagation(&mesh, &temp);
-      MPI_Barrier(MPI_COMM_WORLD);
+    // Fused collide+stream for all process counts.
+    if (comm_size > 1) {
+      lbm_comm_halo_exchange(&mesh_comm, &mesh);
     }
+    collide_and_stream(&temp, &mesh, &mesh_type, &mesh_comm);
+    std::swap(mesh.cells, temp.cells);
 
     // Save step
     if (i % WRITE_STEP_INTERVAL == 0 && lbm_gbl_config.output_filename != NULL) {

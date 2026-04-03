@@ -299,6 +299,130 @@ void lbm_comm_halo_exchange(lbm_comm_t* mc, Mesh* m) {
   free(recv_buf);
 }
 
+// ---------------------------------------------------------------------------
+// Cell-type halo exchange (one-time, at initialisation)
+// ---------------------------------------------------------------------------
+
+/// @brief Bidirectional exchange of int buffers via MPI_Sendrecv.  No-op when
+///        the target rank is -1.
+static void sendrecv_int_buf(
+  const int* send_buf, int send_count, int send_to,
+  int* recv_buf, int recv_count, int recv_from, int tag
+) {
+  if (send_to != -1 && recv_from != -1) {
+    MPI_Sendrecv(send_buf, send_count, MPI_INT, send_to, tag,
+                 recv_buf, recv_count, MPI_INT, recv_from, tag,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  } else if (send_to != -1) {
+    MPI_Send(send_buf, send_count, MPI_INT, send_to, tag, MPI_COMM_WORLD);
+  } else if (recv_from != -1) {
+    MPI_Recv(recv_buf, recv_count, MPI_INT, recv_from, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  }
+}
+
+/// Pack a column of cell types (inner rows j=1..h-2) into a contiguous int buffer.
+static void pack_column_types(const lbm_mesh_type_t* mt, uint32_t x, int* buf) {
+  const int h = (int)mt->height;
+  for (int j = 1; j < h - 1; j++) {
+    buf[j - 1] = (int)*lbm_cell_type_t_get_cell(mt, x, j);
+  }
+}
+
+/// Unpack a contiguous int buffer into a column of cell types.
+static void unpack_column_types(lbm_mesh_type_t* mt, uint32_t x, const int* buf) {
+  const int h = (int)mt->height;
+  for (int j = 1; j < h - 1; j++) {
+    *lbm_cell_type_t_get_cell(mt, x, j) = (lbm_cell_type_t)buf[j - 1];
+  }
+}
+
+/// Pack a row of cell types (inner cols x=1..w-2) into a contiguous int buffer.
+static void pack_row_types(const lbm_mesh_type_t* mt, uint32_t y, int* buf) {
+  const int w = (int)mt->width;
+  for (int x = 1; x < w - 1; x++) {
+    buf[x - 1] = (int)*lbm_cell_type_t_get_cell(mt, x, y);
+  }
+}
+
+/// Unpack a contiguous int buffer into a row of cell types.
+static void unpack_row_types(lbm_mesh_type_t* mt, uint32_t y, const int* buf) {
+  const int w = (int)mt->width;
+  for (int x = 1; x < w - 1; x++) {
+    *lbm_cell_type_t_get_cell(mt, x, y) = (lbm_cell_type_t)buf[x - 1];
+  }
+}
+
+void lbm_comm_exchange_cell_types(lbm_comm_t* mc, lbm_mesh_type_t* mt) {
+  const int w = (int)mc->width;
+  const int h = (int)mc->height;
+  const int col_count = h - 2;  // ints per ghost column
+  const int row_count = w - 2;  // ints per ghost row
+  const int buf_size  = (col_count > row_count) ? col_count : row_count;
+
+  int* send_buf = static_cast<int*>(malloc(sizeof(int) * buf_size));
+  int* recv_buf = static_cast<int*>(malloc(sizeof(int) * buf_size));
+
+  // --- Horizontal: left/right ghost columns ---
+  // Send column w-2 to right, receive column 0 from left (tag=100)
+  pack_column_types(mt, w - 2, send_buf);
+  sendrecv_int_buf(send_buf, col_count, mc->right_id,
+                   recv_buf, col_count, mc->left_id, 100);
+  if (mc->left_id != -1) unpack_column_types(mt, 0, recv_buf);
+
+  // Send column 1 to left, receive column w-1 from right (tag=101)
+  pack_column_types(mt, 1, send_buf);
+  sendrecv_int_buf(send_buf, col_count, mc->left_id,
+                   recv_buf, col_count, mc->right_id, 101);
+  if (mc->right_id != -1) unpack_column_types(mt, w - 1, recv_buf);
+
+  // --- Vertical: top/bottom ghost rows ---
+  // Send row h-2 to bottom, receive row 0 from top (tag=102)
+  pack_row_types(mt, h - 2, send_buf);
+  sendrecv_int_buf(send_buf, row_count, mc->bottom_id,
+                   recv_buf, row_count, mc->top_id, 102);
+  if (mc->top_id != -1) unpack_row_types(mt, 0, recv_buf);
+
+  // Send row 1 to top, receive row h-1 from bottom (tag=103)
+  pack_row_types(mt, 1, send_buf);
+  sendrecv_int_buf(send_buf, row_count, mc->top_id,
+                   recv_buf, row_count, mc->bottom_id, 103);
+  if (mc->bottom_id != -1) unpack_row_types(mt, h - 1, recv_buf);
+
+  // --- Diagonal: 4 corner ghost cells (1 int each) ---
+  int send_type, recv_type;
+
+  // Top-left corner: send (1,1), receive (w-1,h-1) from bottom-right
+  send_type = (int)*lbm_cell_type_t_get_cell(mt, 1, 1);
+  sendrecv_int_buf(&send_type, 1, mc->corner_id[CORNER_TOP_LEFT],
+                   &recv_type, 1, mc->corner_id[CORNER_BOTTOM_RIGHT], 104);
+  if (mc->corner_id[CORNER_BOTTOM_RIGHT] != -1)
+    *lbm_cell_type_t_get_cell(mt, w - 1, h - 1) = (lbm_cell_type_t)recv_type;
+
+  // Top-right corner: send (w-2,1), receive (0,h-1) from bottom-left
+  send_type = (int)*lbm_cell_type_t_get_cell(mt, w - 2, 1);
+  sendrecv_int_buf(&send_type, 1, mc->corner_id[CORNER_TOP_RIGHT],
+                   &recv_type, 1, mc->corner_id[CORNER_BOTTOM_LEFT], 105);
+  if (mc->corner_id[CORNER_BOTTOM_LEFT] != -1)
+    *lbm_cell_type_t_get_cell(mt, 0, h - 1) = (lbm_cell_type_t)recv_type;
+
+  // Bottom-left corner: send (1,h-2), receive (w-1,0) from top-right
+  send_type = (int)*lbm_cell_type_t_get_cell(mt, 1, h - 2);
+  sendrecv_int_buf(&send_type, 1, mc->corner_id[CORNER_BOTTOM_LEFT],
+                   &recv_type, 1, mc->corner_id[CORNER_TOP_RIGHT], 106);
+  if (mc->corner_id[CORNER_TOP_RIGHT] != -1)
+    *lbm_cell_type_t_get_cell(mt, w - 1, 0) = (lbm_cell_type_t)recv_type;
+
+  // Bottom-right corner: send (w-2,h-2), receive (0,0) from top-left
+  send_type = (int)*lbm_cell_type_t_get_cell(mt, w - 2, h - 2);
+  sendrecv_int_buf(&send_type, 1, mc->corner_id[CORNER_BOTTOM_RIGHT],
+                   &recv_type, 1, mc->corner_id[CORNER_TOP_LEFT], 107);
+  if (mc->corner_id[CORNER_TOP_LEFT] != -1)
+    *lbm_cell_type_t_get_cell(mt, 0, 0) = (lbm_cell_type_t)recv_type;
+
+  free(send_buf);
+  free(recv_buf);
+}
+
 void save_frame_all_domain(FILE* fp, Mesh* source_mesh, Mesh* temp) {
   int comm_size, rank;
   MPI_Comm_size(MPI_COMM_WORLD, &comm_size);

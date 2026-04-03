@@ -79,6 +79,10 @@ void lbm_comm_print(const lbm_comm_t* mesh_comm);
 /// @brief Performance halo exchange of ghost cells.
 void lbm_comm_halo_exchange(lbm_comm_t* mesh, Mesh* mesh_to_process);
 
+/// @brief One-time halo exchange of cell types so that ghost cells carry the
+///        correct boundary-condition type from the neighboring rank.
+void lbm_comm_exchange_cell_types(lbm_comm_t* mc, lbm_mesh_type_t* mesh_type);
+
 /// @brief Mesh rendering by doing reduction on rank 0 (master).
 /// @param mesh_comm Communication mesh to use.
 /// @param temp Temporary mesh to store the segments.
