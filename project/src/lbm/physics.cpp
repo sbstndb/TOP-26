@@ -518,3 +518,119 @@ void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_typ
     }
   }
 }
+
+void collide_and_stream_interior(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mesh_comm) {
+  const int w = (int)mesh_in->width;
+  const int h = (int)mesh_in->height;
+
+  static const int dir_x[DIRECTIONS] = {0, +1, 0, -1, 0, +1, -1, -1, +1};
+  static const int dir_y[DIRECTIONS] = {0, 0, +1, 0, -1, +1, +1, -1, -1};
+
+  const double relax = RELAX_PARAMETER;
+
+#if TILE_X > 0
+  for (int i0 = 1; i0 < w - 1; i0 += TILE_X) {
+    const int i_end = (i0 + (int)TILE_X < w - 1) ? (i0 + (int)TILE_X) : (w - 1);
+    for (int i = i0; i < i_end; i++) {
+#else
+  {
+    for (int i = 1; i < w - 1; i++) {
+#endif
+      for (int j = 1; j < h - 1; j++) {
+        double cell_in[DIRECTIONS];
+        Mesh_gather_cell(mesh_in, i, j, cell_in);
+
+        switch (*(lbm_cell_type_t_get_cell(mesh_type, i, j))) {
+        case CELL_FUILD:
+          break;
+        case CELL_BOUNCE_BACK:
+          compute_bounce_back(cell_in);
+          break;
+        case CELL_LEFT_IN:
+          compute_inflow_zou_he_poiseuille_distr(mesh_in, cell_in, j + mesh_comm->y);
+          break;
+        case CELL_RIGHT_OUT:
+          compute_outflow_zou_he_const_density(cell_in);
+          break;
+        }
+
+        double density = 0.0;
+        for (int k = 0; k < DIRECTIONS; k++) density += cell_in[k];
+        const double inv_density = 1.0 / density;
+        double vx = (cell_in[1] - cell_in[3] + cell_in[5] - cell_in[6] - cell_in[7] + cell_in[8]) * inv_density;
+        double vy = (cell_in[2] - cell_in[4] + cell_in[5] + cell_in[6] - cell_in[7] - cell_in[8]) * inv_density;
+        const double v2 = vx * vx + vy * vy;
+        const double p[9] = {0.0, vx, vy, -vx, -vy, vx + vy, -vx + vy, -vx - vy, vx - vy};
+
+        for (int k = 0; k < DIRECTIONS; k++) {
+          const double f_eq = equil_weight[k] * density * (1.0 + 3.0 * p[k] + 4.5 * p[k] * p[k] - 1.5 * v2);
+          Mesh_f(mesh_out, k, i + dir_x[k], j + dir_y[k]) = cell_in[k] - relax * (cell_in[k] - f_eq);
+        }
+      }
+    }
+  }
+}
+
+void collide_and_stream_fixup(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mesh_comm) {
+  const int w = (int)mesh_in->width;
+  const int h = (int)mesh_in->height;
+
+  static const int dir_x[DIRECTIONS] = {0, +1, 0, -1, 0, +1, -1, -1, +1};
+  static const int dir_y[DIRECTIONS] = {0, 0, +1, 0, -1, +1, +1, -1, -1};
+
+  const double relax = RELAX_PARAMETER;
+
+  auto is_inter_rank_ghost = [&](int si, int sj) -> bool {
+    if (si == 0     && mesh_comm->left_id   == -1) return false;
+    if (si == w - 1 && mesh_comm->right_id  == -1) return false;
+    if (sj == 0     && mesh_comm->top_id    == -1) return false;
+    if (sj == h - 1 && mesh_comm->bottom_id == -1) return false;
+    if (si == 0     && mesh_comm->left_id   != -1) return true;
+    if (si == w - 1 && mesh_comm->right_id  != -1) return true;
+    if (sj == 0     && mesh_comm->top_id    != -1) return true;
+    if (sj == h - 1 && mesh_comm->bottom_id != -1) return true;
+    return false;
+  };
+
+  auto fixup_cell = [&](int di, int dj) {
+    for (int k = 0; k < DIRECTIONS; k++) {
+      int si = di - dir_x[k];
+      int sj = dj - dir_y[k];
+      if (si >= 1 && si <= w - 2 && sj >= 1 && sj <= h - 2)
+        continue;
+      if (si < 0 || si >= w || sj < 0 || sj >= h)
+        continue;
+
+      if (is_inter_rank_ghost(si, sj)) {
+        double f_in[DIRECTIONS];
+        Mesh_gather_cell(mesh_in, si, sj, f_in);
+        switch (*lbm_cell_type_t_get_cell(mesh_type, si, sj)) {
+        case CELL_FUILD: break;
+        case CELL_BOUNCE_BACK: compute_bounce_back(f_in); break;
+        case CELL_LEFT_IN: compute_inflow_zou_he_poiseuille_distr(mesh_in, f_in, sj + mesh_comm->y); break;
+        case CELL_RIGHT_OUT: compute_outflow_zou_he_const_density(f_in); break;
+        }
+        double density_g = 0.0;
+        for (int kk = 0; kk < DIRECTIONS; kk++) density_g += f_in[kk];
+        const double inv_rho = 1.0 / density_g;
+        double vx_g = (f_in[1] - f_in[3] + f_in[5] - f_in[6] - f_in[7] + f_in[8]) * inv_rho;
+        double vy_g = (f_in[2] - f_in[4] + f_in[5] + f_in[6] - f_in[7] - f_in[8]) * inv_rho;
+        const double v2_g = vx_g * vx_g + vy_g * vy_g;
+        const double p_g[9] = {0.0, vx_g, vy_g, -vx_g, -vy_g, vx_g+vy_g, -vx_g+vy_g, -vx_g-vy_g, vx_g-vy_g};
+        const double f_eq = equil_weight[k] * density_g * (1.0 + 3.0*p_g[k] + 4.5*p_g[k]*p_g[k] - 1.5*v2_g);
+        Mesh_f(mesh_out, k, di, dj) = f_in[k] - relax * (f_in[k] - f_eq);
+      } else {
+        Mesh_f(mesh_out, k, di, dj) = Mesh_f(mesh_in, k, si, sj);
+      }
+    }
+  };
+
+  for (int j = 0; j <= 1 && j < h; j++)
+    for (int i = 0; i < w; i++) fixup_cell(i, j);
+  for (int j = (h - 2 > 1 ? h - 2 : 2); j < h; j++)
+    for (int i = 0; i < w; i++) fixup_cell(i, j);
+  for (int i = 0; i <= 1 && i < w; i++)
+    for (int j = 2; j < h - 2; j++) fixup_cell(i, j);
+  for (int i = (w - 2 > 1 ? w - 2 : 2); i < w; i++)
+    for (int j = 2; j < h - 2; j++) fixup_cell(i, j);
+}

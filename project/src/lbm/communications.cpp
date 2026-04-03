@@ -163,6 +163,20 @@ void lbm_comm_init(lbm_comm_t* mesh_comm, int rank, int comm_size, uint32_t widt
     mesh_comm->buffer = NULL;
   }
 
+  // Pre-allocate halo exchange buffers for non-blocking comms
+  const int col_count = (int)(mesh_comm->height - 2) * DIRECTIONS;
+  const int row_count = (int)(mesh_comm->width - 2) * DIRECTIONS;
+  const int max_buf = (col_count > row_count ? col_count : row_count);
+  for (int i = 0; i < 4; i++) { // 4 directional exchanges (L,R,T,B)
+    mesh_comm->halo_send_bufs[i] = static_cast<double*>(malloc(sizeof(double) * max_buf));
+    mesh_comm->halo_recv_bufs[i] = static_cast<double*>(malloc(sizeof(double) * max_buf));
+  }
+  for (int i = 4; i < 8; i++) { // 4 corner exchanges (9 doubles each)
+    mesh_comm->halo_send_bufs[i] = static_cast<double*>(malloc(sizeof(double) * DIRECTIONS));
+    mesh_comm->halo_recv_bufs[i] = static_cast<double*>(malloc(sizeof(double) * DIRECTIONS));
+  }
+  mesh_comm->n_requests = 0;
+
   lbm_comm_print(mesh_comm);
 }
 
@@ -175,6 +189,10 @@ void lbm_comm_release(lbm_comm_t* mesh_comm) {
   mesh_comm->left_id  = -1;
   if (mesh_comm->buffer != NULL) {
     free(mesh_comm->buffer);
+  }
+  for (int i = 0; i < 8; i++) {
+    free(mesh_comm->halo_send_bufs[i]);
+    free(mesh_comm->halo_recv_bufs[i]);
   }
 }
 
@@ -297,6 +315,88 @@ void lbm_comm_halo_exchange(lbm_comm_t* mc, Mesh* m) {
 
   free(send_buf);
   free(recv_buf);
+}
+
+// ---------------------------------------------------------------------------
+// Non-blocking halo exchange (for overlap with computation)
+// ---------------------------------------------------------------------------
+
+/// Post Isend/Irecv if neighbor exists. Increments n_requests.
+static void post_isend_irecv(
+  lbm_comm_t* mc, double* send_buf, int count, int send_to,
+  double* recv_buf, int recv_from, int tag
+) {
+  if (send_to != -1) {
+    MPI_Isend(send_buf, count, MPI_DOUBLE, send_to, tag, MPI_COMM_WORLD,
+              &mc->requests[mc->n_requests++]);
+  }
+  if (recv_from != -1) {
+    MPI_Irecv(recv_buf, count, MPI_DOUBLE, recv_from, tag, MPI_COMM_WORLD,
+              &mc->requests[mc->n_requests++]);
+  }
+}
+
+void lbm_comm_halo_exchange_start(lbm_comm_t* mc, Mesh* m) {
+  const int w = mc->width;
+  const int h = mc->height;
+  const int col_count = (h - 2) * DIRECTIONS;
+  const int row_count = (w - 2) * DIRECTIONS;
+  mc->n_requests = 0;
+
+  // Pack and post horizontal exchanges
+  pack_column(m, w - 2, mc->halo_send_bufs[0]);
+  post_isend_irecv(mc, mc->halo_send_bufs[0], col_count, mc->right_id,
+                       mc->halo_recv_bufs[0], mc->left_id, 10);
+
+  pack_column(m, 1, mc->halo_send_bufs[1]);
+  post_isend_irecv(mc, mc->halo_send_bufs[1], col_count, mc->left_id,
+                       mc->halo_recv_bufs[1], mc->right_id, 11);
+
+  // Pack and post vertical exchanges
+  pack_row(m, h - 2, mc->halo_send_bufs[2]);
+  post_isend_irecv(mc, mc->halo_send_bufs[2], row_count, mc->bottom_id,
+                       mc->halo_recv_bufs[2], mc->top_id, 12);
+
+  pack_row(m, 1, mc->halo_send_bufs[3]);
+  post_isend_irecv(mc, mc->halo_send_bufs[3], row_count, mc->top_id,
+                       mc->halo_recv_bufs[3], mc->bottom_id, 13);
+
+  // Pack and post diagonal exchanges (9 doubles each)
+  Mesh_gather_cell(m, 1, 1, mc->halo_send_bufs[4]);
+  post_isend_irecv(mc, mc->halo_send_bufs[4], DIRECTIONS, mc->corner_id[CORNER_TOP_LEFT],
+                       mc->halo_recv_bufs[4], mc->corner_id[CORNER_BOTTOM_RIGHT], 14);
+
+  Mesh_gather_cell(m, w - 2, 1, mc->halo_send_bufs[5]);
+  post_isend_irecv(mc, mc->halo_send_bufs[5], DIRECTIONS, mc->corner_id[CORNER_TOP_RIGHT],
+                       mc->halo_recv_bufs[5], mc->corner_id[CORNER_BOTTOM_LEFT], 15);
+
+  Mesh_gather_cell(m, 1, h - 2, mc->halo_send_bufs[6]);
+  post_isend_irecv(mc, mc->halo_send_bufs[6], DIRECTIONS, mc->corner_id[CORNER_BOTTOM_LEFT],
+                       mc->halo_recv_bufs[6], mc->corner_id[CORNER_TOP_RIGHT], 16);
+
+  Mesh_gather_cell(m, w - 2, h - 2, mc->halo_send_bufs[7]);
+  post_isend_irecv(mc, mc->halo_send_bufs[7], DIRECTIONS, mc->corner_id[CORNER_BOTTOM_RIGHT],
+                       mc->halo_recv_bufs[7], mc->corner_id[CORNER_TOP_LEFT], 17);
+}
+
+void lbm_comm_halo_exchange_wait(lbm_comm_t* mc, Mesh* m) {
+  const int w = mc->width;
+  const int h = mc->height;
+
+  // Wait for all non-blocking operations to complete
+  if (mc->n_requests > 0) {
+    MPI_Waitall(mc->n_requests, mc->requests, MPI_STATUSES_IGNORE);
+  }
+
+  // Unpack received data
+  if (mc->left_id != -1)   unpack_column(m, 0, mc->halo_recv_bufs[0]);
+  if (mc->right_id != -1)  unpack_column(m, w - 1, mc->halo_recv_bufs[1]);
+  if (mc->top_id != -1)    unpack_row(m, 0, mc->halo_recv_bufs[2]);
+  if (mc->bottom_id != -1) unpack_row(m, h - 1, mc->halo_recv_bufs[3]);
+  if (mc->corner_id[CORNER_BOTTOM_RIGHT] != -1) Mesh_scatter_cell(m, w - 1, h - 1, mc->halo_recv_bufs[4]);
+  if (mc->corner_id[CORNER_BOTTOM_LEFT] != -1)  Mesh_scatter_cell(m, 0, h - 1, mc->halo_recv_bufs[5]);
+  if (mc->corner_id[CORNER_TOP_RIGHT] != -1)    Mesh_scatter_cell(m, w - 1, 0, mc->halo_recv_bufs[6]);
+  if (mc->corner_id[CORNER_TOP_LEFT] != -1)     Mesh_scatter_cell(m, 0, 0, mc->halo_recv_bufs[7]);
 }
 
 // ---------------------------------------------------------------------------

@@ -43,8 +43,12 @@ typedef struct lbm_comm_t_s {
   /// ID of the bottom neighboor, -1 if none.
   int bottom_id;
   int corner_id[4];
-  /// Async requests.
+  /// Async requests for non-blocking halo exchange.
   MPI_Request requests[32];
+  int n_requests;
+  /// Pre-allocated pack/unpack buffers for halo exchange.
+  double* halo_send_bufs[8]; // up to 8 messages (2 horiz + 2 vert + 4 corners)
+  double* halo_recv_bufs[8];
   lbm_mesh_cell_t buffer;
 } lbm_comm_t;
 typedef int MPI_Syncfunc_t(MPI_Comm);
@@ -76,8 +80,14 @@ void lbm_comm_release(lbm_comm_t* mesh);
 /// @param mesh_comm Configuration to print.
 void lbm_comm_print(const lbm_comm_t* mesh_comm);
 
-/// @brief Performance halo exchange of ghost cells.
+/// @brief Blocking halo exchange of ghost cells.
 void lbm_comm_halo_exchange(lbm_comm_t* mesh, Mesh* mesh_to_process);
+
+/// @brief Post non-blocking Isend/Irecv for halo exchange. Call _wait() to complete.
+void lbm_comm_halo_exchange_start(lbm_comm_t* mc, Mesh* m);
+
+/// @brief Wait for non-blocking halo exchange to complete and unpack receive buffers.
+void lbm_comm_halo_exchange_wait(lbm_comm_t* mc, Mesh* m);
 
 /// @brief One-time halo exchange of cell types so that ghost cells carry the
 ///        correct boundary-condition type from the neighboring rank.

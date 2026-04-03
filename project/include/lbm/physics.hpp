@@ -101,6 +101,12 @@ void special_cells_and_collision(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t*
 ///        Replaces separate special_cells_and_collision + propagation passes.
 void collide_and_stream(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mesh_comm);
 
+/// @brief Main pass only (inner cells). Does not depend on ghost data.
+void collide_and_stream_interior(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mesh_comm);
+
+/// @brief Fixup pass only (border cells). Requires ghost data to be available.
+void collide_and_stream_fixup(Mesh* mesh_out, Mesh* mesh_in, lbm_mesh_type_t* mesh_type, const lbm_comm_t* mesh_comm);
+
 /// @brief Propagate the densities on the neighboor meshes.
 /// @param mesh_out Output mesh.
 /// @param mesh_in Input mesh (cannot be the same).

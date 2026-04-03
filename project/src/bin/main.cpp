@@ -122,11 +122,15 @@ int main(int argc, char* argv[]) {
     if (rank == RANK_MASTER) {
       fprintf(stderr, "\rStep: %6d/%6d", i, ITERATIONS);
     }
-    // Fused collide+stream for all process counts.
     if (comm_size > 1) {
-      lbm_comm_halo_exchange(&mesh_comm, &mesh);
+      // Overlap: post non-blocking halo exchange, compute interior, wait, fixup
+      lbm_comm_halo_exchange_start(&mesh_comm, &mesh);
+      collide_and_stream_interior(&temp, &mesh, &mesh_type, &mesh_comm);
+      lbm_comm_halo_exchange_wait(&mesh_comm, &mesh);
+      collide_and_stream_fixup(&temp, &mesh, &mesh_type, &mesh_comm);
+    } else {
+      collide_and_stream(&temp, &mesh, &mesh_type, &mesh_comm);
     }
-    collide_and_stream(&temp, &mesh, &mesh_type, &mesh_comm);
     std::swap(mesh.cells, temp.cells);
 
     // Save step
